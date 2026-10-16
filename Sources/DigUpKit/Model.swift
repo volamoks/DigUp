@@ -111,3 +111,16 @@ public enum CodeQuery {
         return trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+/// "name: quarter": what files are called, and the folders they sit in, never what's inside them. A file's name is a
+/// segment of its own (`SegmentKind.name`, keyword only: it has no vector), so this is a keyword search over those.
+public enum NameQuery {
+    public static let prefix = "name:"
+
+    /// What's typed after "name:" ("" for "name:" alone), or nil for a search that isn't one of names.
+    public static func text(of query: String) -> String? {
+        let trimmed = query.drop { $0.isWhitespace }
+        guard trimmed.count >= prefix.count, trimmed.prefix(prefix.count).lowercased() == prefix else { return nil }
+        return trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

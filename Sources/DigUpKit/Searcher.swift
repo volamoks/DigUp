@@ -115,13 +115,18 @@ public final class Searcher {
     public func search(_ text: String, queryVector: [Float]?, kinds: Set<FileKind>? = nil, limit: Int = 20,
                        zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false) throws -> [SearchHit] {
         let wordWeight = wordWeight ?? (isCode ? Self.codeWordWeight : Self.wordWeight)
-        if queryVector != nil, !vectorsLoaded { try reload() }
+        // "name: quarter": only what files are called, never what's inside. A name is a segment of its own, and has no
+        // vector, so this is keyword search over those segments and the meaning side is left out.
+        let nameText = NameQuery.text(of: text)
+        let nameOnly = nameText != nil
+        let text = nameText ?? text
+        if !nameOnly, queryVector != nil, !vectorsLoaded { try reload() }
         let fileKind = self.fileKind
         let allowed = { (file: Int64) -> Bool in kinds == nil || fileKind[file].map { kinds!.contains($0) } ?? false }
 
         // Meaning: score every vector on this query's scale (`meaning`), keep each file's best segment.
         var best: [Int64: (z: Double, cosine: Double, row: Int)] = [:]
-        if let query = queryVector, query.count == Vectors.dimension, !rowFile.isEmpty {
+        if !nameOnly, let query = queryVector, query.count == Vectors.dimension, !rowFile.isEmpty {
             let scores = score(query)
             let meaning = Self.meaning(scores, rowModality, setsScale: rowSetsScale)
             for row in 0..<scores.count where allowed(rowFile[row]) {
@@ -149,10 +154,14 @@ public final class Searcher {
         }
         if !patterns.isEmpty {
             var seen = Set<Int64>()
+            // "name:" keeps only the segments that hold a file's name and folders; every other kind is what's inside.
+            // Its words are in the fts "name" column (0), not the "body" one (1), so the snippet comes from there.
+            let nameSegment = nameOnly ? " AND s.kind = 'name'" : ""
+            let snippetColumn = nameOnly ? 0 : 1
             try store.db.query("""
-                SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts
+                SELECT s.file, s.id, snippet(fts, \(snippetColumn), '«', '»', '…', 12), fts.original FROM fts
                 JOIN segments s ON s.id = fts.rowid
-                WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000
+                WHERE fts MATCH ?\(nameSegment) ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000
                 """, [.text(patterns.joined(separator: " OR "))]) { row in
                 let file = row.int(0)
                 guard words.count < 100, allowed(file), seen.insert(file).inserted else { return }
@@ -165,7 +174,7 @@ public final class Searcher {
                 for pattern in patterns {
                     try store.db.query("""
                         SELECT DISTINCT s.file FROM fts JOIN segments s ON s.id = fts.rowid
-                        WHERE fts MATCH ? AND s.file IN (\(files))
+                        WHERE fts MATCH ? AND s.file IN (\(files))\(nameSegment)
                         """, [.text(pattern)]) { coverage[$0.int(0), default: 0] += 1 / Double(patterns.count) }
                 }
             }
@@ -176,7 +185,9 @@ public final class Searcher {
         // One common word can't beat a strong meaning match; all the words of an exact lookup usually do.
         // (This beat reciprocal-rank fusion on both evals, 2026-10-07: R@1 0.88 vs 0.73 synthetic, 0.86 vs 0.82 real.)
         let lookup = Self.isLookup(terms) || identifier != nil
-        let (meaningWeight, wordsWeight) = lookup ? (0.5, wordWeight * 2) : (1, wordWeight)
+        // A name has no vector, so a "name:" search counts the words alone.
+        let meaningWeight = nameOnly ? 0 : (lookup ? 0.5 : 1)
+        let wordsWeight = lookup ? wordWeight * 2 : wordWeight
         let hinted = Self.kindHints(text)
         var candidates = Set(best.filter { $0.value.z >= zGate }.keys)
         for (file, share) in coverage where share >= 0.5 { candidates.insert(file) }
